@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+tweepy
+praw
+openai
+schedule
+requests 
