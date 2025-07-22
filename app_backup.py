@@ -1,6 +1,6 @@
-# app.py  – 2-week auto-campaign + comment hunter
+ # app.py  – 2-week auto-campaign + comment hunter
 import os, json, time, sqlite3, schedule, threading, requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from openai import OpenAI
 import tweepy, praw
 import streamlit as st
@@ -40,6 +40,27 @@ WHATSAPP_TOKEN  = os.getenv("WHATSAPP_TOKEN")
 PRODUCT_URL     = os.getenv("PRODUCT_URL", "https://bit.ly/qorganizer")
 
 DB_FILE = "campaign.db"
+
+# Ensure table exists at startup using helper function
+def init_database():
+    """Initialize database with proper error handling"""
+    try:
+        execute_db_query("""
+        CREATE TABLE IF NOT EXISTS posts(
+            id TEXT PRIMARY KEY,
+            platform TEXT,
+            text TEXT,
+            scheduled TEXT,
+            posted INTEGER DEFAULT 0,
+            permalink TEXT
+        )""")
+        return True
+    except Exception as e:
+        print(f"Database initialization error: {e}")
+        return False
+
+# Initialize database
+init_database()
 
 db_lock = threading.Lock()
 
@@ -86,30 +107,14 @@ def execute_db_query(query, params=None, fetch=False):
                 raise e
     return None
 
-# Ensure table exists at startup using helper function
-def init_database():
-    """Initialize database with proper error handling"""
-    try:
-        execute_db_query("""
-        CREATE TABLE IF NOT EXISTS posts(
-            id TEXT PRIMARY KEY,
-            platform TEXT,
-            text TEXT,
-            scheduled TEXT,
-            posted INTEGER DEFAULT 0,
-            permalink TEXT
-        )""")
-        return True
-    except Exception as e:
-        print(f"Database initialization error: {e}")
-        return False
-
-# Initialize database
-init_database()
-
 # --------------------------------------------------
 # 1.  GROQ LLM
 # --------------------------------------------------
+# client = OpenAI(
+#     base_url="https://api.groq.com/openai/v1",
+#     api_key=GROQ_KEY
+# )
+
 # -------------------- LLM Fallback Logic --------------------
 FALLBACK_MODELS = [
     # Compound models (Groq, rate-limited, not paywalled)
@@ -184,99 +189,44 @@ def smart_chat(prompt, max_tokens=120):
                 },
                 timeout=15
             )
-            if r.status_code == 200:
-                return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception:
-            pass
-    return "⚠️ All free models busy, please retry."
+st.title("🤖 Auto-Campaign for QuickOrganizer")
+if st.button("Generate & Schedule"):
+    try:
+        plan = get_plan()
+        for p in plan:
+            text = smart_chat(p["prompt"] + f"\nEnd with link: {PRODUCT_URL}", max_tokens=120)
+            if not text: 
+                continue
+            scheduled = (datetime.utcnow() + timedelta(days=p["day"])).isoformat(timespec="minutes")
+            post_id = f"{p['platform']}_{p['day']}"
+            
+            # Use the new database helper function
+            execute_db_query(
+                "INSERT OR IGNORE INTO posts VALUES(?,?,?,?,0,'')",
+                (post_id, p["platform"], text, scheduled)
+            )
+        st.success("Posts queued!")
+    except Exception as e:
+        st.error(f"Error generating posts: {e}")
+        add_log(f"Error generating posts: {e}")
 
-# --------------------------------------------------
-# 2.  PLATFORM CLIENTS
-# --------------------------------------------------
-def twitter_client():
-    """Create Twitter client using API v1.1 (original working method)"""
-    auth = tweepy.OAuth1UserHandler(TW_API_KEY, TW_API_SECRET, TW_ACCESS, TW_ACCESS_SECRET)
-    return tweepy.API(auth)
-
-def reddit_client():
-    return praw.Reddit(
-        client_id=REDDIT_CLIENT,
-        client_secret=REDDIT_SECRET,
-        username=REDDIT_USER,
-        password=REDDIT_PW,
-        user_agent=REDDIT_UA
+try:
+    df = execute_db_query("SELECT id,platform,text,scheduled,posted FROM posts ORDER BY scheduled", fetch=True)
+    if df:
+        st.dataframe(df)
+    else:
+        st.info("No posts scheduled yet.")
+except Exception as e:
+    st.error(f"Error loading posts: {e}")
+    add_log(f"Error loading posts: {e}")nt=REDDIT_UA
     )
 
 # --------------------------------------------------
 # 3.  2-WEEK CALENDAR (EXTENSIBLE)
 # --------------------------------------------------
-def get_plan():
-    # This could be loaded from a config/db in the future
-    platforms = [
-        {"platform": "x", "prompt": "Write a catchy 1-sentence tweet about messy downloads"},
-        {"platform": "reddit", "prompt": "150-word intro post for r/productivity", "sub": "productivity"},
-        {"platform": "linkedin", "prompt": "100-word LinkedIn post for freelancers"}
-    ]
-    plan = []
-    for day in range(14):
-        for i, p in enumerate(platforms):
-            entry = dict(p)
-            entry["day"] = day
-            # Spread posts throughout the day (every 8 hours)
-            entry["hour_offset"] = i * 8
-            plan.append(entry)
-    return plan
-
-# --------------------------------------------------
-# 5.  POSTER + COMMENT REPLIER (EXTENSIBLE)
-# --------------------------------------------------
-# Initialize logs in session state
-if 'logs' not in st.session_state:
-    st.session_state['logs'] = []
-
-MAX_LOGS = 50  # Number of log entries to keep
-
-# Thread-safe logging using file-based approach
-import threading
-log_lock = threading.Lock()
-
-def add_log(message):
-    """Thread-safe logging that works from background threads"""
-    timestamp = datetime.now(timezone.utc).isoformat(timespec='seconds')
-    log_entry = f"[{timestamp}] {message}"
-    
-    try:
-        # Try to update session state (works in main thread)
-        if hasattr(st, 'session_state'):
-            logs = st.session_state.get('logs', [])
-            logs.append(log_entry)
-            st.session_state['logs'] = logs[-MAX_LOGS:]
-    except:
-        # Fallback: write to file for background threads
-        with log_lock:
-            try:
-                with open("campaign_logs.txt", "a", encoding="utf-8") as f:
-                    f.write(log_entry + "\n")
-            except:
-                pass  # Ignore file write errors
-
-def load_logs_from_file():
-    """Load logs from file into session state"""
-    try:
-        if os.path.exists("campaign_logs.txt"):
-            with open("campaign_logs.txt", "r", encoding="utf-8") as f:
-                file_logs = f.readlines()
-            # Merge with session logs, avoiding duplicates
-            session_logs = st.session_state.get('logs', [])
-            all_logs = list(set(session_logs + [log.strip() for log in file_logs]))
-            all_logs.sort()  # Sort by timestamp
-            st.session_state['logs'] = all_logs[-MAX_LOGS:]
-    except:
-        pass
-
 def poster():
     try:
-        now = datetime.now(timezone.utc).isoformat(timespec="minutes")
+        now = datetime.utcnow().isoformat(timespec="minutes")
         rows = execute_db_query("SELECT * FROM posts WHERE scheduled <= ? AND posted=0", (now,), fetch=True)
         
         if not rows:
@@ -288,15 +238,7 @@ def poster():
             id_, plat, txt, _, _, _ = r
             try:
                 if plat == "x":
-                    client = twitter_client()
-                    # Use Twitter API v2 for posting
-                    response = client.create_tweet(text=txt)
-                    tweet_id = response.data['id']
-                    execute_db_query(
-                        "UPDATE posts SET posted=1, permalink=? WHERE id=?", 
-                if plat == "x":
                     api = twitter_client()
-                    # Use Twitter API v1.1 method (original working method)
                     tweet = api.update_status(txt)
                     execute_db_query(
                         "UPDATE posts SET posted=1, permalink=? WHERE id=?", 
@@ -304,6 +246,13 @@ def poster():
                     )
                     posted_platforms.add("X (Twitter)")
                     add_log(f"Posted to X: {tweet.id}")
+                    
+                elif plat == "reddit":
+                    reddit = reddit_client()
+                    sub = next((p.get("sub") for p in get_plan() if f"{p['platform']}_{p['day']}" == id_), None)
+                    if sub:
+                        post = reddit.subreddit(sub).submit(title=txt[:100], selftext=txt)
+                        execute_db_query(
                             "UPDATE posts SET posted=1, permalink=? WHERE id=?", 
                             (post.url, id_)
                         )
@@ -325,19 +274,6 @@ def poster():
             except Exception as e:
                 st.error(f"{plat} error: {e}")
                 add_log(f"Error posting to {plat}: {e}")
-                
-        # Show message in UI after posting
-        if posted_platforms:
-            st.session_state["last_posted"] = f"✅ Finished posting to: {', '.join(posted_platforms)}"
-            add_log(st.session_state["last_posted"])
-        else:
-            st.session_state["last_posted"] = "No posts were ready to send."
-            
-    except Exception as e:
-        error_msg = f"Error in poster function: {e}"
-        add_log(error_msg)
-        st.session_state["last_posted"] = f"❌ {error_msg}"
-
 def comment_replier():
     try:
         reddit = reddit_client()
@@ -350,63 +286,26 @@ def comment_replier():
                         add_log(f"Replied to Reddit comment {comment.id} on post {post.id}")
                     time.sleep(2)  # avoid spam
     except Exception as e:
-        add_log(f"Error in comment_replier: {e}")
+        add_log(f"Error in comment_replier: {e}")on_state.get('logs', [])
+    logs.append(f"[{datetime.utcnow().isoformat(timespec='seconds')}] {message}")
+    st.session_state['logs'] = logs[-MAX_LOGS:]
 
+def poster():
+    conn_bg = sqlite3.connect(DB_FILE, check_same_thread=False)
+    now = datetime.utcnow().isoformat(timespec="minutes")
 schedule.every(1).minutes.do(poster)
 schedule.every(10).minutes.do(comment_replier)
 
 # Background scheduler thread
 def run_scheduler():
     """Run scheduler in background with error handling"""
-    import logging
-    logging.getLogger("streamlit").setLevel(logging.ERROR)  # Suppress ScriptRunContext warnings
-    
     while True:
         try:
             schedule.run_pending()
             time.sleep(30)  # Check every 30 seconds
         except Exception as e:
-            # Use print instead of add_log to avoid ScriptRunContext issues
-            print(f"[{datetime.utcnow().isoformat()}] Scheduler error: {e}")
+            add_log(f"Scheduler error: {e}")
             time.sleep(60)  # Wait longer on error
-
-# --------------------------------------------------
-# 4.  UI
-# --------------------------------------------------
-st.title("🤖 Auto-Campaign for QuickOrganizer")
-
-if st.button("Generate & Schedule"):
-    try:
-        plan = get_plan()
-        for p in plan:
-            text = smart_chat(p["prompt"] + f"\nEnd with link: {PRODUCT_URL}", max_tokens=120)
-            if not text: 
-                continue
-            
-            # Calculate schedule time with hour offset for better distribution
-            hour_offset = p.get("hour_offset", 0)
-            scheduled = (datetime.now(timezone.utc) + timedelta(days=p["day"], hours=hour_offset)).isoformat(timespec="minutes")
-            post_id = f"{p['platform']}_{p['day']}_{hour_offset}"
-            
-            # Use the new database helper function
-            execute_db_query(
-                "INSERT OR IGNORE INTO posts VALUES(?,?,?,?,0,'')",
-                (post_id, p["platform"], text, scheduled)
-            )
-        st.success("Posts queued!")
-    except Exception as e:
-        st.error(f"Error generating posts: {e}")
-        add_log(f"Error generating posts: {e}")
-
-try:
-    df = execute_db_query("SELECT id,platform,text,scheduled,posted FROM posts ORDER BY scheduled", fetch=True)
-    if df:
-        st.dataframe(df)
-    else:
-        st.info("No posts scheduled yet.")
-except Exception as e:
-    st.error(f"Error loading posts: {e}")
-    add_log(f"Error loading posts: {e}")
 
 # Initialize scheduler thread as daemon
 if 'scheduler_started' not in st.session_state:
@@ -422,6 +321,67 @@ if st.button("Start scheduler"):
         add_log("Scheduler started successfully")
     else:
         st.info("Scheduler is already running")
+                api = twitter_client()
+                tweet = api.update_status(txt)
+                with db_lock:
+                    conn_bg.execute("UPDATE posts SET posted=1, permalink=? WHERE id=?", (f"https://twitter.com/i/web/status/{tweet.id}", id_))
+                posted_platforms.add("X (Twitter)")
+                add_log(f"Posted to X: {tweet.id}")
+            elif plat == "reddit":
+                reddit = reddit_client()
+                sub = next((p.get("sub") for p in get_plan() if f"{p['platform']}_{p['day']}" == id_), None)
+                if sub:
+                    post = reddit.subreddit(sub).submit(title=txt[:100], selftext=txt)
+                    with db_lock:
+                        conn_bg.execute("UPDATE posts SET posted=1, permalink=? WHERE id=?", (post.url, id_))
+                    posted_platforms.add(f"Reddit (r/{sub})")
+                    add_log(f"Posted to Reddit r/{sub}: {post.url}")
+            elif plat == "linkedin":
+                headers = {"Authorization": f"Bearer {LINKEDIN_TOKEN}", "Content-Type": "application/json"}
+                payload = {"author": "urn:li:person:me", "lifecycleState": "PUBLISHED",
+                           "specificContent": {"com.linkedin.ugc.ShareContent": {
+                               "shareCommentary": {"text": txt}, "shareMediaCategory": "NONE"}},
+                           "visibility": {"com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"}}
+                r = requests.post("https://api.linkedin.com/v2/ugcPosts", headers=headers, json=payload)
+                if r.status_code == 201:
+                    with db_lock:
+                        conn_bg.execute("UPDATE posts SET posted=1 WHERE id=?", (id_,))
+                    posted_platforms.add("LinkedIn")
+                    add_log(f"Posted to LinkedIn: {id_}")
+        except Exception as e:
+            st.error(f"{plat} error: {e}")
+            add_log(f"Error posting to {plat}: {e}")
+    with db_lock:
+        conn_bg.commit()
+    # Show message in UI after posting
+    if posted_platforms:
+        st.session_state["last_posted"] = f"✅ Finished posting to: {', '.join(posted_platforms)}"
+        add_log(st.session_state["last_posted"])
+    else:
+        st.session_state["last_posted"] = "No scheduled posts to send right now."
+    conn_bg.close()
+
+def comment_replier():
+    conn_bg = sqlite3.connect(DB_FILE, check_same_thread=False)
+    reddit = reddit_client()
+    for post in reddit.user.me().submissions.new(limit=10):
+        for comment in post.comments:
+            if comment.author and comment.author.name != REDDIT_USER and PRODUCT_URL not in comment.body:
+                reply = smart_chat(f"Reply politely to Reddit comment: {comment.body}\nMention {PRODUCT_URL} in 1 sentence.")
+                if reply:
+                    with db_lock:
+                        comment.reply(reply)
+                    add_log(f"Replied to Reddit comment {comment.id} on post {post.id}")
+                time.sleep(2)  # avoid spam
+    conn_bg.close()
+
+schedule.every(1).minutes.do(poster)
+schedule.every(10).minutes.do(comment_replier)
+
+if st.button("Start scheduler"):
+    poster()  # Immediately process any due posts
+    threading.Thread(target=lambda: schedule.run_pending(), daemon=True).start()
+    st.info("Scheduler running (check logs)")
 
 # Show last posting summary if available
 if "last_posted" in st.session_state:
@@ -429,25 +389,9 @@ if "last_posted" in st.session_state:
 
 # Log panel UI
 st.markdown("### 📋 Background Log Panel")
-
-# Load any logs from background threads
-load_logs_from_file()
-
 if st.button("Refresh logs"):
-    load_logs_from_file()  # Refresh from file
-    
-if st.button("Clear logs"):
-    st.session_state['logs'] = []
-    try:
-        os.remove("campaign_logs.txt")
-    except:
-        pass
-
-current_logs = st.session_state.get('logs', [])
-if current_logs:
-    st.text_area("Logs (last 50 actions):", value="\n".join(current_logs[-MAX_LOGS:]), height=300)
-else:
-    st.info("No logs yet. Start the scheduler to see activity logs.")
+    pass  # Just triggers rerun
+st.text_area("Logs (last 50 actions):", value="\n".join(st.session_state['logs']), height=300)
 
 # --------------------------------------------------
 # 6.  PACKAGE FOR OTHERS  (limited-scope keys)
